@@ -1,0 +1,33 @@
+substitutions:
+  _REGION: us-central1
+  _REPOSITORY: video-automation
+  _SERVICE: video-automation
+  _IMAGE: ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:$SHORT_SHA
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_IMAGE}", "."]
+
+  - name: gcr.io/cloud-builders/docker
+    args: ["push", "${_IMAGE}"]
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_IMAGE}
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --port=8080
+      - --cpu=1
+      - --memory=2Gi
+      - --concurrency=10
+      - --max-instances=10
+      - --set-env-vars=ENVIRONMENT=production,STORAGE_BACKEND=gcs,GCS_PREFIX=video-automation
+      - --set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest
+
+images:
+  - ${_IMAGE}
