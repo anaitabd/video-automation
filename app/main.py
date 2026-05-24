@@ -1,17 +1,54 @@
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+import time
+
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.pipeline.orchestrator import PipelineRequest, VideoAutomationOrchestrator
-from app.utils.logger import get_logger
+from app.utils.logger import classify_failure_reason, get_logger, job_context, log_timed_event
 
 load_dotenv()
 logger = get_logger(__name__)
 
 app = FastAPI(title="AI Video Automation API", version="1.0.0", description="AI video orchestration service")
 orchestrator = VideoAutomationOrchestrator()
+
+
+@app.middleware("http")
+async def observability_middleware(request: Request, call_next):
+    header_job_id = request.headers.get("x-job-id")
+    body_job_id = None
+    if request.method.upper() == "POST" and request.url.path == "/generate-video":
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                body_job_id = body.get("job_id")
+        except Exception:
+            pass
+    request_job_id = str(body_job_id or header_job_id or "request-scope")
+
+    with job_context(request_job_id):
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+            log_timed_event(
+                logger,
+                event="api_request",
+                start_time=start,
+                method=request.method,
+                path=request.url.path,
+                status_code=response.status_code,
+            )
+            response.headers["x-job-id"] = request_job_id
+            return response
+        except Exception as exc:
+            logger.exception(
+                "request failed",
+                extra={"event": "api_request", "failure_reason": classify_failure_reason(exc)},
+            )
+            raise
 
 
 class GenerateVideoRequest(BaseModel):
