@@ -1,8 +1,10 @@
+import hashlib
 import json
 import os
+import shutil
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence, Union
 from urllib import error, request
 
 from app.utils.logger import get_logger
@@ -10,8 +12,12 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+SceneInput = Dict[str, object]
+NarrationInput = Union[str, Sequence[SceneInput]]
+
+
 class VoiceGeneratorService:
-    """Converts a script into voice-over audio using ElevenLabs."""
+    """Generate narration audio with ElevenLabs and cache deterministic outputs."""
 
     def __init__(
         self,
@@ -20,14 +26,16 @@ class VoiceGeneratorService:
         voice_id: Optional[str] = None,
         stability: Optional[float] = None,
         similarity_boost: Optional[float] = None,
+        fallback_voice_id: Optional[str] = None,
         model_id: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
         max_retries: Optional[int] = None,
         base_retry_delay_seconds: Optional[float] = None,
     ) -> None:
-        self.voice_provider = os.getenv("VOICE_PROVIDER", "elevenlabs")
+        self.voice_provider = "elevenlabs"
         self.api_key = api_key or os.getenv("ELEVENLABS_API_KEY", "")
         self.voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+        self.fallback_voice_id = fallback_voice_id or os.getenv("ELEVENLABS_FALLBACK_VOICE_ID", "MF3mGyEYCl7XYWbV9V6O")
         self.stability = self._normalize_float(
             stability if stability is not None else float(os.getenv("ELEVENLABS_STABILITY", "0.5")),
             "stability",
@@ -48,7 +56,9 @@ class VoiceGeneratorService:
         )
 
         self.output_dir = Path(os.getenv("OUTPUT_DIR", "output"))
+        self.cache_dir = self.output_dir / "audio_cache"
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _normalize_float(value: float, field_name: str) -> float:
@@ -56,19 +66,52 @@ class VoiceGeneratorService:
             raise ValueError(f"{field_name} must be between 0.0 and 1.0, got {value}")
         return value
 
-    def generate_voice(self, script: str, output_path: str) -> str:
-        """Generate speech from script text and save an mp3 file locally."""
-        if not script or not script.strip():
-            raise ValueError("script must be a non-empty string")
-        if not self.api_key:
-            raise ValueError("ELEVENLABS_API_KEY is required")
+    def _render_narration_text(self, narration: NarrationInput) -> str:
+        if isinstance(narration, str):
+            text = narration.strip()
+            if not text:
+                raise ValueError("script must be a non-empty string")
+            return text
 
-        output_file = Path(output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
+        if not narration:
+            raise ValueError("scene list must not be empty")
 
-        endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}"
+        lines: List[str] = []
+        for index, scene in enumerate(narration, start=1):
+            if not isinstance(scene, dict):
+                raise ValueError(f"scene at index {index - 1} must be an object")
+
+            text = str(scene.get("text", "")).strip()
+            if not text:
+                continue
+
+            duration_seconds = scene.get("duration_seconds")
+            prefix = f"Scene {index}"
+            if duration_seconds is not None:
+                prefix = f"{prefix} ({duration_seconds}s)"
+            lines.append(f"{prefix}: {text}")
+
+        combined = "\n".join(lines).strip()
+        if not combined:
+            raise ValueError("scene list did not contain any narration text")
+        return combined
+
+    def _cache_key(self, text: str, voice_id: str) -> str:
         payload = {
-            "text": script,
+            "text": text,
+            "voice_id": voice_id,
+            "fallback_voice_id": self.fallback_voice_id,
+            "stability": self.stability,
+            "similarity_boost": self.similarity_boost,
+            "model_id": self.model_id,
+        }
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return digest
+
+    def _call_elevenlabs(self, text: str, output_file: Path, voice_id: str) -> str:
+        endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        payload = {
+            "text": text,
             "model_id": self.model_id,
             "voice_settings": {
                 "stability": self.stability,
@@ -101,32 +144,57 @@ class VoiceGeneratorService:
                     raise RuntimeError("ElevenLabs API returned empty audio data")
 
                 output_file.write_bytes(audio_bytes)
-                logger.info("Generated voice audio file at %s", output_file)
+                logger.info("Generated narration with voice_id=%s at %s", voice_id, output_file)
                 return str(output_file)
-
             except error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
                 message = f"ElevenLabs HTTPError {exc.code}: {body}"
-                logger.warning("Attempt %s/%s failed: %s", attempt, self.max_retries, message)
+                logger.warning("Attempt %s/%s voice_id=%s failed: %s", attempt, self.max_retries, voice_id, message)
                 last_error = RuntimeError(message)
                 if exc.code < 500 and exc.code != 429:
                     break
             except (error.URLError, TimeoutError, RuntimeError) as exc:
-                logger.warning("Attempt %s/%s failed: %s", attempt, self.max_retries, exc)
+                logger.warning("Attempt %s/%s voice_id=%s failed: %s", attempt, self.max_retries, voice_id, exc)
                 last_error = exc
 
             if attempt < self.max_retries:
                 sleep_seconds = self.base_retry_delay_seconds * (2 ** (attempt - 1))
                 time.sleep(sleep_seconds)
 
-        raise RuntimeError(f"Failed to generate voice after {self.max_retries} attempts") from last_error
+        raise RuntimeError(f"Failed to generate narration after {self.max_retries} attempts for voice_id={voice_id}") from last_error
 
-    def synthesize(self, script: str, video_id: str) -> Dict[str, str]:
+    def generate_voice(self, narration: NarrationInput, output_path: str) -> str:
+        """Generate narration from script text or scene list and save one synchronized mp3."""
+        if not self.api_key:
+            raise ValueError("ELEVENLABS_API_KEY is required")
+
+        text = self._render_narration_text(narration)
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        cache_key = self._cache_key(text=text, voice_id=self.voice_id)
+        cached_file = self.cache_dir / f"{cache_key}.mp3"
+        if cached_file.exists():
+            shutil.copy2(cached_file, output_file)
+            logger.info("Narration cache hit key=%s -> %s", cache_key, output_file)
+            return str(output_file)
+
+        try:
+            generated_path = self._call_elevenlabs(text=text, output_file=output_file, voice_id=self.voice_id)
+        except Exception as primary_error:
+            logger.warning("Primary voice generation failed for voice_id=%s; trying fallback voice_id=%s", self.voice_id, self.fallback_voice_id)
+            generated_path = self._call_elevenlabs(text=text, output_file=output_file, voice_id=self.fallback_voice_id)
+            logger.info("Fallback voice succeeded after primary failure: %s", primary_error)
+
+        shutil.copy2(generated_path, cached_file)
+        return generated_path
+
+    def synthesize(self, script: NarrationInput, video_id: str) -> Dict[str, str]:
         """Generate narration audio file for a video id."""
-        logger.info("Synthesizing voice with provider=%s", self.voice_provider)
+        logger.info("Synthesizing narration provider=%s", self.voice_provider)
 
         audio_path = self.output_dir / f"{video_id}.mp3"
-        generated_path = self.generate_voice(script=script, output_path=str(audio_path))
+        generated_path = self.generate_voice(narration=script, output_path=str(audio_path))
 
         return {
             "provider": self.voice_provider,
