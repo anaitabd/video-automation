@@ -13,21 +13,18 @@ logger = get_logger(__name__)
 
 
 def _render_script_for_voice(script: Dict[str, object]) -> str:
-    supporting_points = script.get("supporting_points", [])
-    if not isinstance(supporting_points, list):
-        supporting_points = []
+    sections = script.get("sections", [])
+    if not isinstance(sections, list):
+        sections = []
 
-    points_lines = [f"- {point}" for point in supporting_points]
+    section_lines = [f"- {section}" for section in sections if isinstance(section, str)]
 
     return "\n".join(
         [
-            f"Hook: {script.get('hook_0_5s', '')}",
-            f"Problem: {script.get('problem_introduction', '')}",
-            f"Explanation: {script.get('explanation_simple', '')}",
-            "Supporting points:",
-            *points_lines,
-            f"Conclusion: {script.get('conclusion', '')}",
-            f"Call to action: {script.get('call_to_action', '')}",
+            f"Hook: {script.get('hook', '')}",
+            "Sections:",
+            *section_lines,
+            f"Call to action: {script.get('cta', '')}",
         ]
     ).strip()
 
