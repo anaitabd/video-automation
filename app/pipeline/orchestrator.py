@@ -11,6 +11,26 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _render_script_for_voice(script: Dict[str, object]) -> str:
+    supporting_points = script.get("supporting_points", [])
+    if not isinstance(supporting_points, list):
+        supporting_points = []
+
+    points_lines = [f"- {point}" for point in supporting_points]
+
+    return "\n".join(
+        [
+            f"Hook: {script.get('hook_0_5s', '')}",
+            f"Problem: {script.get('problem_introduction', '')}",
+            f"Explanation: {script.get('explanation_simple', '')}",
+            "Supporting points:",
+            *points_lines,
+            f"Conclusion: {script.get('conclusion', '')}",
+            f"Call to action: {script.get('call_to_action', '')}",
+        ]
+    ).strip()
+
+
 @dataclass
 class PipelineRequest:
     topic: str
@@ -31,13 +51,14 @@ class VideoAutomationOrchestrator:
         logger.info("Pipeline started video_id=%s topic=%s", video_id, request.topic)
 
         script_data = self.script_generator.generate(topic=request.topic, tone=request.tone)
-        voice_data = self.voice_generator.synthesize(script=script_data["script"], video_id=video_id)
+        rendered_script = _render_script_for_voice(script=script_data["script"])
+        voice_data = self.voice_generator.synthesize(script=rendered_script, video_id=video_id)
         fetched_videos = self.video_fetcher.fetch(topic=request.topic)
         composed_video = self.video_composer.compose(
             video_id=video_id,
             assets=fetched_videos["assets"],
             audio_path=voice_data["audio_path"],
-            script=script_data["script"],
+            script=rendered_script,
         )
 
         logger.info("Pipeline completed video_id=%s", video_id)
