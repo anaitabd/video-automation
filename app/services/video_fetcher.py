@@ -13,9 +13,6 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 PEXELS_API_BASE = "https://api.pexels.com"
-ASSETS_DIR = Path(os.getenv("ASSETS_DIR", "./assets")).resolve()
-VIDEO_DOWNLOAD_DIR = ASSETS_DIR / "videos"
-IMAGE_DOWNLOAD_DIR = ASSETS_DIR / "images"
 
 _STOPWORDS = {
     "a",
@@ -138,7 +135,7 @@ def _pick_best_video_file(video_files: Sequence[Dict[str, object]]) -> str:
     return str(max(valid_files, key=_score)["link"])
 
 
-def fetch_assets(script: str) -> List[str]:
+def fetch_assets(script: str, download_dir: str) -> List[str]:
     """Fetch stock assets from Pexels based on script sentences and return local file paths."""
     api_key = os.getenv("PEXELS_API_KEY", "").strip()
     if not api_key:
@@ -190,7 +187,7 @@ def fetch_assets(script: str) -> List[str]:
         if best_video_url and best_video_score >= 0.2:
             local_video = _download_file(
                 best_video_url,
-                destination_dir=VIDEO_DOWNLOAD_DIR,
+                destination_dir=Path(download_dir),
                 prefix=f"clip_{idx:02d}",
                 extension=".mp4",
             )
@@ -225,7 +222,7 @@ def fetch_assets(script: str) -> List[str]:
         if best_photo_url:
             local_image = _download_file(
                 best_photo_url,
-                destination_dir=IMAGE_DOWNLOAD_DIR,
+                destination_dir=Path(download_dir),
                 prefix=f"image_{idx:02d}",
                 extension=".jpg",
             )
@@ -242,7 +239,7 @@ class VideoFetcherService:
     def __init__(self) -> None:
         self.provider = os.getenv("VIDEO_PROVIDER", "pexels")
 
-    def fetch(self, topic: str, limit: int = 3) -> Dict[str, List[str]]:
+    def fetch(self, topic: str, download_dir: str, limit: int = 3) -> Dict[str, List[str]]:
         logger.info("Fetching videos with provider=%s, topic=%s", self.provider, topic)
-        assets = fetch_assets(topic)[:limit]
+        assets = fetch_assets(topic, download_dir=download_dir)[:limit]
         return {"provider": self.provider, "assets": assets}

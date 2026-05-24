@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-import shutil
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
@@ -55,10 +54,6 @@ class VoiceGeneratorService:
             else float(os.getenv("ELEVENLABS_BASE_RETRY_DELAY_SECONDS", "1.5"))
         )
 
-        self.output_dir = Path(os.getenv("OUTPUT_DIR", "output"))
-        self.cache_dir = self.output_dir / "audio_cache"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _normalize_float(value: float, field_name: str) -> float:
@@ -173,12 +168,6 @@ class VoiceGeneratorService:
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
         cache_key = self._cache_key(text=text, voice_id=self.voice_id)
-        cached_file = self.cache_dir / f"{cache_key}.mp3"
-        if cached_file.exists():
-            shutil.copy2(cached_file, output_file)
-            logger.info("Narration cache hit key=%s -> %s", cache_key, output_file)
-            return str(output_file)
-
         try:
             generated_path = self._call_elevenlabs(text=text, output_file=output_file, voice_id=self.voice_id)
         except Exception as primary_error:
@@ -186,15 +175,13 @@ class VoiceGeneratorService:
             generated_path = self._call_elevenlabs(text=text, output_file=output_file, voice_id=self.fallback_voice_id)
             logger.info("Fallback voice succeeded after primary failure: %s", primary_error)
 
-        shutil.copy2(generated_path, cached_file)
         return generated_path
 
-    def synthesize(self, script: NarrationInput, video_id: str) -> Dict[str, str]:
-        """Generate narration audio file for a video id."""
+    def synthesize(self, script: NarrationInput, audio_path: str) -> Dict[str, str]:
+        """Generate narration audio file to a caller-provided path."""
         logger.info("Synthesizing narration provider=%s", self.voice_provider)
 
-        audio_path = self.output_dir / f"{video_id}.mp3"
-        generated_path = self.generate_voice(narration=script, output_path=str(audio_path))
+        generated_path = self.generate_voice(narration=script, output_path=audio_path)
 
         return {
             "provider": self.voice_provider,
