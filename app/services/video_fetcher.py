@@ -239,7 +239,21 @@ class VideoFetcherService:
     def __init__(self) -> None:
         self.provider = os.getenv("VIDEO_PROVIDER", "pexels")
 
+    def _placeholder(self, download_dir: str, idx: int) -> str:
+        from PIL import Image, ImageDraw
+
+        out = Path(download_dir) / f"placeholder_{idx:02d}.jpg"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        img = Image.new("RGB", (1080, 1920), color=(25, 25, 25))
+        draw = ImageDraw.Draw(img)
+        draw.text((60, 920), f"Placeholder scene {idx}", fill=(240, 240, 240))
+        img.save(out, format="JPEG")
+        return str(out)
+
     def fetch(self, topic: str, download_dir: str, limit: int = 3) -> Dict[str, List[str]]:
         logger.info("Fetching videos with provider=%s, topic=%s", self.provider, topic)
         assets = fetch_assets(topic, download_dir=download_dir)[:limit]
+        if len(assets) < limit:
+            for idx in range(len(assets) + 1, limit + 1):
+                assets.append(self._placeholder(download_dir, idx))
         return {"provider": self.provider, "assets": assets}
