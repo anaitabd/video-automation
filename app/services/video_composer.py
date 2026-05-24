@@ -3,6 +3,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -10,42 +11,37 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
 TARGET_WIDTH = 1080
 TARGET_HEIGHT = 1920
 FPS = 30
+MIN_SCENE_SECONDS = 0.20
+DEFAULT_TRANSITION_SECONDS = 0.35
+
+
+@dataclass
+class SceneSpec:
+    asset_path: str
+    duration_seconds: float
 
 
 def _run(cmd: List[str]) -> None:
-    """Run shell command and raise a rich error on failure."""
     logger.debug("Running command: %s", " ".join(shlex.quote(part) for part in cmd))
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or "").strip()
-        stdout = (exc.stdout or "").strip()
         raise RuntimeError(
             "FFmpeg command failed.\n"
             f"Command: {' '.join(cmd)}\n"
             f"Exit code: {exc.returncode}\n"
-            f"STDOUT: {stdout}\n"
-            f"STDERR: {stderr}"
+            f"STDOUT: {(exc.stdout or '').strip()}\n"
+            f"STDERR: {(exc.stderr or '').strip()}"
         ) from exc
 
 
 def _probe_duration_seconds(path: str) -> float:
-    cmd = [
-        FFPROBE_BIN,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "json",
-        path,
-    ]
+    cmd = [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration", "-of", "json", path]
     output = subprocess.check_output(cmd, text=True)
     parsed = json.loads(output)
     duration = float(parsed["format"]["duration"])
@@ -58,30 +54,62 @@ def _is_image(path: str) -> bool:
     return Path(path).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
-def compose_video(audio_path: str, assets: List[str], output_path: str) -> str:
-    """
-    Build a vertical 1080x1920 MP4 by sequencing assets under the full audio duration.
+def _normalize_scene_durations(raw_durations: List[float], total_duration: float) -> List[float]:
+    if not raw_durations:
+        raise ValueError("Scene durations are required")
+    cleaned = [max(MIN_SCENE_SECONDS, float(d)) for d in raw_durations]
+    raw_sum = sum(cleaned)
+    if raw_sum <= 0:
+        raise ValueError("Invalid scene durations")
+    scale = total_duration / raw_sum
+    normalized = [max(MIN_SCENE_SECONDS, d * scale) for d in cleaned]
+    correction = total_duration - sum(normalized)
+    normalized[-1] += correction
+    normalized[-1] = max(MIN_SCENE_SECONDS, normalized[-1])
+    return normalized
 
-    Features implemented:
-    - auto trim each clip segment to fit the total audio duration
-    - smooth concatenation with xfade fade in/out transitions
-    - optional subtitle burn-in if sibling .srt exists (same stem as output)
-      or if VIDEO_SUBTITLE_PATH environment variable is provided
-    """
+
+def _scene_specs_from_assets(audio_duration: float, assets: List[str]) -> List[SceneSpec]:
     if not assets:
         raise ValueError("assets list is empty")
-    if not Path(audio_path).exists():
-        raise FileNotFoundError(f"Audio file not found: {audio_path}")
-
     for asset in assets:
         if not Path(asset).exists():
             raise FileNotFoundError(f"Asset not found: {asset}")
+    per_asset_duration = audio_duration / len(assets)
+    return [SceneSpec(asset_path=asset, duration_seconds=per_asset_duration) for asset in assets]
+
+
+def _scene_specs_from_scene_list(audio_duration: float, scenes: List[Dict[str, object]]) -> List[SceneSpec]:
+    if not scenes:
+        raise ValueError("scenes list is empty")
+    assets: List[str] = []
+    durations: List[float] = []
+    for i, scene in enumerate(scenes):
+        asset = str(scene.get("asset") or scene.get("asset_path") or "").strip()
+        duration = scene.get("duration_seconds")
+        if not asset:
+            raise ValueError(f"scene[{i}] missing asset path")
+        if duration is None:
+            raise ValueError(f"scene[{i}] missing duration_seconds")
+        if not Path(asset).exists():
+            raise FileNotFoundError(f"Asset not found: {asset}")
+        assets.append(asset)
+        durations.append(float(duration))
+    normalized = _normalize_scene_durations(durations, audio_duration)
+    return [SceneSpec(asset_path=assets[i], duration_seconds=normalized[i]) for i in range(len(assets))]
+
+
+def compose_video(audio_path: str, output_path: str, assets: Optional[List[str]] = None, scenes: Optional[List[Dict[str, object]]] = None) -> str:
+    if not Path(audio_path).exists():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    if (not assets and not scenes) or (assets and scenes):
+        raise ValueError("Provide exactly one of: assets or scenes")
 
     audio_duration = _probe_duration_seconds(audio_path)
-    asset_count = len(assets)
+    scene_specs = _scene_specs_from_scene_list(audio_duration, scenes) if scenes else _scene_specs_from_assets(audio_duration, assets or [])
 
-    transition_duration = min(0.6, max(0.2, audio_duration / max(asset_count * 8, 1)))
-    per_asset_duration = (audio_duration + (asset_count - 1) * transition_duration) / asset_count
+    transition_duration = min(DEFAULT_TRANSITION_SECONDS, min(spec.duration_seconds for spec in scene_specs) / 3)
+    transition_duration = max(0.15, transition_duration)
 
     output_file = Path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -94,121 +122,139 @@ def compose_video(audio_path: str, assets: List[str], output_path: str) -> str:
 
     with tempfile.TemporaryDirectory(prefix="video_compose_") as temp_dir:
         prepared_paths: List[str] = []
+        segment_durations: List[float] = []
 
-        # Normalize all assets into uniform vertical MP4 segments with no audio.
-        for idx, asset in enumerate(assets):
+        for idx, scene in enumerate(scene_specs):
             segment_path = str(Path(temp_dir) / f"segment_{idx:03d}.mp4")
             vf = (
                 f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
                 f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
                 f"fps={FPS},format=yuv420p"
             )
+            common = [
+                FFMPEG_BIN,
+                "-y",
+                "-threads",
+                "2",
+                "-i",
+                scene.asset_path,
+                "-t",
+                f"{scene.duration_seconds:.3f}",
+                "-vf",
+                vf,
+                "-an",
+                "-vsync",
+                "cfr",
+                "-r",
+                str(FPS),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "20",
+                "-pix_fmt",
+                "yuv420p",
+                segment_path,
+            ]
+            cmd = common
+            if _is_image(scene.asset_path):
+                cmd = [FFMPEG_BIN, "-y", "-threads", "2", "-loop", "1", "-i", scene.asset_path] + common[5:]
 
-            if _is_image(asset):
-                cmd = [
+            try:
+                _run(cmd)
+            except Exception as exc:
+                logger.warning("Skipping corrupt or unsupported clip %s: %s", scene.asset_path, exc)
+                fallback_cmd = [
                     FFMPEG_BIN,
                     "-y",
-                    "-loop",
-                    "1",
-                    "-t",
-                    f"{per_asset_duration:.3f}",
+                    "-f",
+                    "lavfi",
                     "-i",
-                    asset,
+                    f"color=c=black:s={TARGET_WIDTH}x{TARGET_HEIGHT}:d={scene.duration_seconds:.3f}",
                     "-vf",
-                    vf,
+                    f"fps={FPS},format=yuv420p",
                     "-an",
                     "-c:v",
                     "libx264",
                     "-preset",
                     "medium",
                     "-crf",
-                    "20",
-                    "-r",
-                    str(FPS),
+                    "24",
                     segment_path,
                 ]
-            else:
-                cmd = [
-                    FFMPEG_BIN,
-                    "-y",
-                    "-i",
-                    asset,
-                    "-t",
-                    f"{per_asset_duration:.3f}",
-                    "-vf",
-                    vf,
-                    "-an",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "medium",
-                    "-crf",
-                    "20",
-                    "-r",
-                    str(FPS),
-                    segment_path,
-                ]
+                _run(fallback_cmd)
 
-            _run(cmd)
             prepared_paths.append(segment_path)
+            segment_durations.append(scene.duration_seconds)
 
-        # Build xfade filter graph for smooth fades between segments.
-        ffmpeg_cmd: List[str] = [FFMPEG_BIN, "-y"]
+        ffmpeg_cmd: List[str] = [FFMPEG_BIN, "-y", "-threads", "2"]
         for segment in prepared_paths:
             ffmpeg_cmd += ["-i", segment]
         ffmpeg_cmd += ["-i", audio_path]
 
         filter_parts: List[str] = []
         if len(prepared_paths) == 1:
-            filter_parts.append("[0:v]setpts=PTS-STARTPTS[vfinal]")
-            video_label = "vfinal"
+            filter_parts.append("[0:v]setpts=PTS-STARTPTS[vmix]")
+            video_label = "vmix"
         else:
             current_label = "0:v"
-            cumulative_offset = per_asset_duration - transition_duration
+            cumulative = max(segment_durations[0] - transition_duration, 0.01)
             for i in range(1, len(prepared_paths)):
-                next_label = f"{i}:v"
-                output_label = f"vxf{i}"
+                out = f"vxf{i}"
                 filter_parts.append(
-                    f"[{current_label}][{next_label}]"
-                    f"xfade=transition=fade:duration={transition_duration:.3f}:offset={cumulative_offset:.3f}"
-                    f"[{output_label}]"
+                    f"[{current_label}][{i}:v]xfade=transition=fade:duration={transition_duration:.3f}:offset={cumulative:.3f}[{out}]"
                 )
-                current_label = output_label
-                cumulative_offset += per_asset_duration - transition_duration
+                current_label = out
+                cumulative += max(segment_durations[i] - transition_duration, 0.01)
             video_label = current_label
+
+        filter_parts.append(f"[{video_label}]fps={FPS},format=yuv420p,trim=duration={audio_duration:.3f}[vtrim]")
+        video_label = "vtrim"
 
         if subtitle_path:
             escaped_sub = subtitle_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
             filter_parts.append(f"[{video_label}]subtitles='{escaped_sub}'[vfinal]")
             video_label = "vfinal"
 
-        filter_complex = ";".join(filter_parts)
-
         ffmpeg_cmd += [
             "-filter_complex",
-            filter_complex,
+            ";".join(filter_parts),
             "-map",
             f"[{video_label}]",
             "-map",
             f"{len(prepared_paths)}:a",
+            "-af",
+            "aresample=async=1:min_hard_comp=0.100:first_pts=0",
             "-c:v",
             "libx264",
+            "-profile:v",
+            "high",
+            "-level",
+            "4.1",
             "-pix_fmt",
             "yuv420p",
             "-preset",
             "medium",
             "-crf",
             "20",
+            "-g",
+            str(FPS * 2),
             "-c:a",
             "aac",
             "-b:a",
             "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
             "-shortest",
             "-movflags",
             "+faststart",
+            "-max_muxing_queue_size",
+            "2048",
             str(output_file),
         ]
-
         _run(ffmpeg_cmd)
 
     return str(output_file.resolve())
@@ -217,7 +263,14 @@ def compose_video(audio_path: str, assets: List[str], output_path: str) -> str:
 class VideoComposerService:
     """Composes final video from footage + voice-over + subtitles."""
 
-    def compose(self, assets: List[str], audio_path: str, output_path: str, script: str) -> Dict[str, str]:
+    def compose(
+        self,
+        audio_path: str,
+        output_path: str,
+        script: str,
+        assets: Optional[List[str]] = None,
+        scenes: Optional[List[Dict[str, object]]] = None,
+    ) -> Dict[str, str]:
         logger.info("Composing video output=%s", output_path)
-        composed = compose_video(audio_path=audio_path, assets=assets, output_path=output_path)
+        composed = compose_video(audio_path=audio_path, output_path=output_path, assets=assets, scenes=scenes)
         return {"final_video_path": composed}
