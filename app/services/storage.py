@@ -7,6 +7,8 @@ from typing import Protocol
 
 from google.cloud import storage
 
+from app.utils.retry import CircuitBreaker, CircuitBreakerPolicy, ErrorCategory, RetryPolicy, TransientExternalError, retryable
+
 
 class StorageClient(Protocol):
     def upload_file(self, local_path: str, remote_path: str) -> str: ...
@@ -23,11 +25,26 @@ class GCSStorageClient:
             raise ValueError("GCS_BUCKET_NAME is required")
         self.client = storage.Client()
         self.bucket = self.client.bucket(self.bucket_name)
+        self.retry_policy = RetryPolicy(
+            max_retries=int(os.getenv("GCS_MAX_RETRIES", "3")),
+            base_delay_seconds=float(os.getenv("GCS_RETRY_BASE_DELAY_SECONDS", "1.0")),
+            timeout_seconds=float(os.getenv("GCS_TIMEOUT_SECONDS", "60")),
+        )
+        self.circuit_breaker = CircuitBreaker(
+            CircuitBreakerPolicy(
+                failure_threshold=int(os.getenv("GCS_CIRCUIT_FAILURE_THRESHOLD", "5")),
+                recovery_timeout_seconds=float(os.getenv("GCS_CIRCUIT_RECOVERY_SECONDS", "30.0")),
+            )
+        )
 
     def upload_file(self, local_path: str, remote_path: str) -> str:
-        blob = self.bucket.blob(remote_path)
-        blob.upload_from_filename(local_path)
-        return f"gs://{self.bucket_name}/{remote_path}"
+        @retryable(retry_policy=self.retry_policy, circuit_breaker=self.circuit_breaker, classifier=lambda exc: ErrorCategory.TRANSIENT)
+        def _upload() -> str:
+            blob = self.bucket.blob(remote_path)
+            blob.upload_from_filename(local_path, timeout=self.retry_policy.timeout_seconds)
+            return f"gs://{self.bucket_name}/{remote_path}"
+
+        return _upload()
 
     def download_file(self, remote_path: str, local_path: str) -> str:
         blob = self.bucket.blob(remote_path)
@@ -36,9 +53,17 @@ class GCSStorageClient:
         return local_path
 
     def upload_json(self, payload: dict, remote_path: str) -> str:
-        blob = self.bucket.blob(remote_path)
-        blob.upload_from_string(json.dumps(payload, ensure_ascii=False), content_type="application/json")
-        return f"gs://{self.bucket_name}/{remote_path}"
+        @retryable(retry_policy=self.retry_policy, circuit_breaker=self.circuit_breaker, classifier=lambda exc: ErrorCategory.TRANSIENT)
+        def _upload() -> str:
+            blob = self.bucket.blob(remote_path)
+            blob.upload_from_string(
+                json.dumps(payload, ensure_ascii=False),
+                content_type="application/json",
+                timeout=self.retry_policy.timeout_seconds,
+            )
+            return f"gs://{self.bucket_name}/{remote_path}"
+
+        return _upload()
 
 
 class JobWorkspace:
