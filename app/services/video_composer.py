@@ -3,11 +3,12 @@ import os
 import shlex
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from app.utils.logger import get_logger
+from app.utils.logger import classify_failure_reason, get_logger, log_timed_event
 from app.utils.retry import CircuitBreaker, CircuitBreakerPolicy, ErrorCategory, RetryPolicy, retryable
 
 logger = get_logger(__name__)
@@ -45,8 +46,10 @@ def _run(cmd: List[str]) -> None:
 
     @retryable(retry_policy=_FFMPEG_RETRY_POLICY, circuit_breaker=_FFMPEG_CIRCUIT_BREAKER, classifier=lambda exc: ErrorCategory.TRANSIENT)
     def _execute() -> None:
+        started_at = time.perf_counter()
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=_FFMPEG_RETRY_POLICY.timeout_seconds)
+            log_timed_event(logger, event="ffmpeg_command", start_time=started_at, command=cmd[0], args_count=len(cmd)-1)
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(
                 "FFmpeg command failed.\n"
@@ -183,7 +186,7 @@ def compose_video(audio_path: str, output_path: str, assets: Optional[List[str]]
             try:
                 _run(cmd)
             except Exception as exc:
-                logger.warning("Skipping corrupt or unsupported clip %s: %s", scene.asset_path, exc)
+                logger.warning("Skipping corrupt or unsupported clip %s: %s", scene.asset_path, exc, extra={"event": "ffmpeg_command", "failure_reason": classify_failure_reason(exc)})
                 fallback_cmd = [
                     FFMPEG_BIN,
                     "-y",
@@ -274,7 +277,9 @@ def compose_video(audio_path: str, output_path: str, assets: Optional[List[str]]
             "2048",
             str(output_file),
         ]
+        compose_start = time.perf_counter()
         _run(ffmpeg_cmd)
+        log_timed_event(logger, event="ffmpeg_render_duration", start_time=compose_start, output_path=str(output_file))
 
     return str(output_file.resolve())
 

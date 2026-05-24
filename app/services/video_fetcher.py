@@ -8,7 +8,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
-from app.utils.logger import get_logger
+import time
+
+from app.utils.logger import classify_failure_reason, get_logger, log_timed_event
 
 logger = get_logger(__name__)
 
@@ -107,8 +109,11 @@ def _pexels_request(path_with_query: str, api_key: str) -> Dict[str, object]:
         f"{PEXELS_API_BASE}{path_with_query}",
         headers={"Authorization": api_key, "User-Agent": "video-automation/1.0"},
     )
+    start_time = time.perf_counter()
     with urlopen(request, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+        payload = json.loads(response.read().decode("utf-8"))
+        log_timed_event(logger, event="external_api_latency", start_time=start_time, provider="pexels", endpoint=path_with_query, status_code=getattr(response, "status", 200))
+        return payload
 
 
 def _download_file(url: str, destination_dir: Path, prefix: str, extension: str) -> str:
@@ -162,6 +167,7 @@ def fetch_assets(script: str, download_dir: str) -> List[str]:
             payload = _pexels_request(f"/videos/search?query={encoded_query}&per_page=10&page=1", api_key=api_key)
             videos = payload.get("videos", []) if isinstance(payload, dict) else []
         except (HTTPError, URLError, TimeoutError) as exc:
+            logger.warning("Pexels request failed", extra={"event": "external_api_latency", "failure_reason": classify_failure_reason(exc), "details": {"provider": "pexels", "query": query}})
             logger.warning("Pexels video search failed for query '%s': %s", query, exc)
             videos = []
 
@@ -199,6 +205,7 @@ def fetch_assets(script: str, download_dir: str) -> List[str]:
             image_payload = _pexels_request(f"/v1/search?query={encoded_query}&per_page=10&page=1", api_key=api_key)
             photos = image_payload.get("photos", []) if isinstance(image_payload, dict) else []
         except (HTTPError, URLError, TimeoutError) as exc:
+            logger.warning("Pexels request failed", extra={"event": "external_api_latency", "failure_reason": classify_failure_reason(exc), "details": {"provider": "pexels", "query": query}})
             logger.warning("Pexels image search failed for query '%s': %s", query, exc)
             photos = []
 

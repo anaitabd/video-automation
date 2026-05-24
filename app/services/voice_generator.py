@@ -1,12 +1,13 @@
 import hashlib
 import json
 import os
-import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
 from urllib import error, request
 
-from app.utils.logger import get_logger
+import time
+
+from app.utils.logger import classify_failure_reason, get_logger, log_timed_event
 from app.utils.retry import (
     CircuitBreaker,
     CircuitBreakerPolicy,
@@ -154,6 +155,7 @@ class VoiceGeneratorService:
                 },
                 method="POST",
             )
+            start_time = time.perf_counter()
             try:
                 with request.urlopen(req, timeout=self.timeout_seconds) as response:
                     status_code = getattr(response, "status", 200)
@@ -162,7 +164,9 @@ class VoiceGeneratorService:
                     if status_code >= 400:
                         raise PermanentExternalError(f"ElevenLabs HTTP {status_code}")
                     audio_bytes = response.read()
+                    log_timed_event(logger, event="external_api_latency", start_time=start_time, provider="elevenlabs", endpoint="text_to_speech", status_code=status_code)
             except error.HTTPError as exc:
+                logger.warning("ElevenLabs HTTP error", extra={"event": "external_api_latency", "failure_reason": classify_failure_reason(exc), "details": {"provider": "elevenlabs", "status_code": exc.code}})
                 if exc.code >= 500 or exc.code == 429:
                     raise TransientExternalError(f"ElevenLabs HTTPError {exc.code}") from exc
                 raise PermanentExternalError(f"ElevenLabs HTTPError {exc.code}") from exc
