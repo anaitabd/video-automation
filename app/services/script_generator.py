@@ -8,6 +8,14 @@ from google import genai
 from google.genai import types
 
 from app.utils.logger import get_logger
+from app.utils.retry import (
+    CircuitBreaker,
+    CircuitBreakerPolicy,
+    ErrorCategory,
+    RetryPolicy,
+    TransientExternalError,
+    retryable,
+)
 
 logger = get_logger(__name__)
 
@@ -103,6 +111,19 @@ class ScriptGeneratorService:
         self.max_retries = int(os.getenv("SCRIPT_GENERATION_MAX_RETRIES", "3"))
         self.retry_base_delay = float(os.getenv("SCRIPT_GENERATION_RETRY_BASE_DELAY_SECONDS", "1.0"))
         self.timeout_seconds = float(os.getenv("SCRIPT_GENERATION_TIMEOUT_SECONDS", "45"))
+        self.retry_policy = RetryPolicy(
+            max_retries=self.max_retries,
+            base_delay_seconds=self.retry_base_delay,
+            timeout_seconds=self.timeout_seconds,
+            backoff_multiplier=float(os.getenv("SCRIPT_GENERATION_BACKOFF_MULTIPLIER", "2.0")),
+            max_delay_seconds=float(os.getenv("SCRIPT_GENERATION_MAX_DELAY_SECONDS", "30.0")),
+        )
+        self.circuit_breaker = CircuitBreaker(
+            CircuitBreakerPolicy(
+                failure_threshold=int(os.getenv("SCRIPT_GENERATION_CIRCUIT_FAILURE_THRESHOLD", "5")),
+                recovery_timeout_seconds=float(os.getenv("SCRIPT_GENERATION_CIRCUIT_RECOVERY_SECONDS", "30.0")),
+            )
+        )
 
         self.client = genai.Client(
             vertexai=True,
@@ -127,46 +148,38 @@ class ScriptGeneratorService:
             response_schema=STRICT_SCHEMA,
         )
 
-        last_error: Exception | None = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self.client.models.generate_content,
-                        model=self.model_name,
-                        contents=_build_user_prompt(
-                            topic=sanitized_topic,
-                            language=selected_language,
-                            tone=tone,
-                            target_duration_seconds=target_duration_seconds,
-                        ),
-                        config=config,
-                    ),
-                    timeout=self.timeout_seconds,
-                )
+        @retryable(
+            retry_policy=self.retry_policy,
+            circuit_breaker=self.circuit_breaker,
+            classifier=lambda exc: ErrorCategory.TRANSIENT,
+        )
+        async def _call_gemini() -> Dict[str, Any]:
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=self.model_name,
+                contents=_build_user_prompt(
+                    topic=sanitized_topic,
+                    language=selected_language,
+                    tone=tone,
+                    target_duration_seconds=target_duration_seconds,
+                ),
+                config=config,
+            )
+            content = (response.text or "").strip()
+            parsed = json.loads(content)
+            self._validate_output(parsed, target_duration_seconds=target_duration_seconds)
+            return parsed
 
-                content = (response.text or "").strip()
-                parsed = json.loads(content)
-                self._validate_output(parsed, target_duration_seconds=target_duration_seconds)
-
-                return {
-                    "topic": sanitized_topic,
-                    "tone": tone,
-                    "language": selected_language,
-                    "model": self.model_name,
-                    "script": parsed,
-                    "style": "youtube_shorts_documentary",
-                    "raw": parsed,
-                }
-            except Exception as exc:
-                last_error = exc
-                if attempt >= self.max_retries:
-                    break
-                delay = self.retry_base_delay * (2 ** (attempt - 1))
-                logger.warning("Script generation attempt %s/%s failed; retrying in %.2fs. error=%s", attempt, self.max_retries, delay, exc)
-                await asyncio.sleep(delay)
-
-        raise RuntimeError("Failed to generate script after retries") from last_error
+        parsed = await _call_gemini()
+        return {
+            "topic": sanitized_topic,
+            "tone": tone,
+            "language": selected_language,
+            "model": self.model_name,
+            "script": parsed,
+            "style": "youtube_shorts_documentary",
+            "raw": parsed,
+        }
 
     def generate(self, topic: str, tone: str = "documentary", language: str | None = None, target_duration_seconds: int = 120) -> Dict[str, Any]:
         return asyncio.run(self.generate_async(topic=topic, tone=tone, language=language, target_duration_seconds=target_duration_seconds))

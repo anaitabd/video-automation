@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from app.utils.logger import get_logger
+from app.utils.retry import CircuitBreaker, CircuitBreakerPolicy, ErrorCategory, RetryPolicy, retryable
 
 logger = get_logger(__name__)
 
@@ -19,6 +20,19 @@ FPS = 30
 MIN_SCENE_SECONDS = 0.20
 DEFAULT_TRANSITION_SECONDS = 0.35
 
+_FFMPEG_RETRY_POLICY = RetryPolicy(
+    max_retries=int(os.getenv("FFMPEG_MAX_RETRIES", "3")),
+    base_delay_seconds=float(os.getenv("FFMPEG_RETRY_BASE_DELAY_SECONDS", "1.0")),
+    timeout_seconds=float(os.getenv("FFMPEG_TIMEOUT_SECONDS", "180")),
+    max_delay_seconds=float(os.getenv("FFMPEG_MAX_DELAY_SECONDS", "30.0")),
+)
+_FFMPEG_CIRCUIT_BREAKER = CircuitBreaker(
+    CircuitBreakerPolicy(
+        failure_threshold=int(os.getenv("FFMPEG_CIRCUIT_FAILURE_THRESHOLD", "5")),
+        recovery_timeout_seconds=float(os.getenv("FFMPEG_CIRCUIT_RECOVERY_SECONDS", "30.0")),
+    )
+)
+
 
 @dataclass
 class SceneSpec:
@@ -28,16 +42,21 @@ class SceneSpec:
 
 def _run(cmd: List[str]) -> None:
     logger.debug("Running command: %s", " ".join(shlex.quote(part) for part in cmd))
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(
-            "FFmpeg command failed.\n"
-            f"Command: {' '.join(cmd)}\n"
-            f"Exit code: {exc.returncode}\n"
-            f"STDOUT: {(exc.stdout or '').strip()}\n"
-            f"STDERR: {(exc.stderr or '').strip()}"
-        ) from exc
+
+    @retryable(retry_policy=_FFMPEG_RETRY_POLICY, circuit_breaker=_FFMPEG_CIRCUIT_BREAKER, classifier=lambda exc: ErrorCategory.TRANSIENT)
+    def _execute() -> None:
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=_FFMPEG_RETRY_POLICY.timeout_seconds)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                "FFmpeg command failed.\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"Exit code: {exc.returncode}\n"
+                f"STDOUT: {(exc.stdout or '').strip()}\n"
+                f"STDERR: {(exc.stderr or '').strip()}"
+            ) from exc
+
+    _execute()
 
 
 def _probe_duration_seconds(path: str) -> float:

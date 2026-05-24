@@ -7,6 +7,15 @@ from typing import Dict, List, Optional, Sequence, Union
 from urllib import error, request
 
 from app.utils.logger import get_logger
+from app.utils.retry import (
+    CircuitBreaker,
+    CircuitBreakerPolicy,
+    ErrorCategory,
+    PermanentExternalError,
+    RetryPolicy,
+    TransientExternalError,
+    retryable,
+)
 
 logger = get_logger(__name__)
 
@@ -52,6 +61,19 @@ class VoiceGeneratorService:
             base_retry_delay_seconds
             if base_retry_delay_seconds is not None
             else float(os.getenv("ELEVENLABS_BASE_RETRY_DELAY_SECONDS", "1.5"))
+        )
+        self.retry_policy = RetryPolicy(
+            max_retries=self.max_retries,
+            base_delay_seconds=self.base_retry_delay_seconds,
+            timeout_seconds=float(self.timeout_seconds),
+            backoff_multiplier=float(os.getenv("ELEVENLABS_BACKOFF_MULTIPLIER", "2.0")),
+            max_delay_seconds=float(os.getenv("ELEVENLABS_MAX_DELAY_SECONDS", "30.0")),
+        )
+        self.circuit_breaker = CircuitBreaker(
+            CircuitBreakerPolicy(
+                failure_threshold=int(os.getenv("ELEVENLABS_CIRCUIT_FAILURE_THRESHOLD", "5")),
+                recovery_timeout_seconds=float(os.getenv("ELEVENLABS_CIRCUIT_RECOVERY_SECONDS", "30.0")),
+            )
         )
 
 
@@ -103,6 +125,11 @@ class VoiceGeneratorService:
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
         return digest
 
+    def _classify_elevenlabs_error(self, exc: Exception) -> ErrorCategory:
+        if isinstance(exc, PermanentExternalError):
+            return ErrorCategory.PERMANENT
+        return ErrorCategory.TRANSIENT
+
     def _call_elevenlabs(self, text: str, output_file: Path, voice_id: str) -> str:
         endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
         payload = {
@@ -115,8 +142,8 @@ class VoiceGeneratorService:
         }
         data = json.dumps(payload).encode("utf-8")
 
-        last_error: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
+        @retryable(retry_policy=self.retry_policy, circuit_breaker=self.circuit_breaker, classifier=self._classify_elevenlabs_error)
+        def _attempt_request() -> str:
             req = request.Request(
                 url=endpoint,
                 data=data,
@@ -127,36 +154,28 @@ class VoiceGeneratorService:
                 },
                 method="POST",
             )
-
             try:
                 with request.urlopen(req, timeout=self.timeout_seconds) as response:
                     status_code = getattr(response, "status", 200)
+                    if status_code >= 500:
+                        raise TransientExternalError(f"ElevenLabs HTTP {status_code}")
                     if status_code >= 400:
-                        raise RuntimeError(f"ElevenLabs API returned HTTP {status_code}")
+                        raise PermanentExternalError(f"ElevenLabs HTTP {status_code}")
                     audio_bytes = response.read()
-
-                if not audio_bytes:
-                    raise RuntimeError("ElevenLabs API returned empty audio data")
-
-                output_file.write_bytes(audio_bytes)
-                logger.info("Generated narration with voice_id=%s at %s", voice_id, output_file)
-                return str(output_file)
             except error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
-                message = f"ElevenLabs HTTPError {exc.code}: {body}"
-                logger.warning("Attempt %s/%s voice_id=%s failed: %s", attempt, self.max_retries, voice_id, message)
-                last_error = RuntimeError(message)
-                if exc.code < 500 and exc.code != 429:
-                    break
-            except (error.URLError, TimeoutError, RuntimeError) as exc:
-                logger.warning("Attempt %s/%s voice_id=%s failed: %s", attempt, self.max_retries, voice_id, exc)
-                last_error = exc
+                if exc.code >= 500 or exc.code == 429:
+                    raise TransientExternalError(f"ElevenLabs HTTPError {exc.code}") from exc
+                raise PermanentExternalError(f"ElevenLabs HTTPError {exc.code}") from exc
+            except (error.URLError, TimeoutError) as exc:
+                raise TransientExternalError(str(exc)) from exc
 
-            if attempt < self.max_retries:
-                sleep_seconds = self.base_retry_delay_seconds * (2 ** (attempt - 1))
-                time.sleep(sleep_seconds)
+            if not audio_bytes:
+                raise TransientExternalError("ElevenLabs API returned empty audio data")
+            output_file.write_bytes(audio_bytes)
+            logger.info("Generated narration with voice_id=%s at %s", voice_id, output_file)
+            return str(output_file)
 
-        raise RuntimeError(f"Failed to generate narration after {self.max_retries} attempts for voice_id={voice_id}") from last_error
+        return _attempt_request()
 
     def generate_voice(self, narration: NarrationInput, output_path: str) -> str:
         """Generate narration from script text or scene list and save one synchronized mp3."""
