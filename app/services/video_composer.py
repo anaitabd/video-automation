@@ -217,12 +217,7 @@ def compose_video(audio_path: str, assets: List[str], output_path: str) -> str:
 class VideoComposerService:
     """Composes final video from footage + voice-over + subtitles."""
 
-    def __init__(self) -> None:
-        self.output_dir = Path(os.getenv("OUTPUT_DIR", "output"))
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def compose(self, video_id: str, assets: List[str], audio_path: str, script: str) -> Dict[str, str]:
-        logger.info("Composing video for video_id=%s", video_id)
-        final_path = self.output_dir / f"{video_id}.mp4"
-        composed = compose_video(audio_path=audio_path, assets=assets, output_path=str(final_path))
+    def compose(self, assets: List[str], audio_path: str, output_path: str, script: str) -> Dict[str, str]:
+        logger.info("Composing video output=%s", output_path)
+        composed = compose_video(audio_path=audio_path, assets=assets, output_path=output_path)
         return {"final_video_path": composed}
