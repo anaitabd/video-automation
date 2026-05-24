@@ -21,7 +21,6 @@ orchestrator = VideoAutomationOrchestrator()
 
 class GenerateVideoRequest(BaseModel):
     topic: str = Field(..., min_length=3, max_length=200)
-    tone: str = Field(default="professional", min_length=3, max_length=50)
 
 
 @app.get("/health")
@@ -33,12 +32,14 @@ def health() -> dict:
     }
 
 
-@app.post("/v1/videos/generate")
+@app.post("/generate-video")
 def generate_video(payload: GenerateVideoRequest) -> dict:
     try:
-        pipeline_request = PipelineRequest(topic=payload.topic, tone=payload.tone)
-        result = orchestrator.run(request=pipeline_request)
-        return {"success": True, "data": result}
+        pipeline_request = PipelineRequest(topic=payload.topic)
+        return orchestrator.run(request=pipeline_request)
+    except ValueError as exc:
+        logger.exception("Video generation validation failed")
+        raise HTTPException(status_code=400, detail=f"Invalid request: {exc}") from exc
     except Exception as exc:
         logger.exception("Video generation failed")
-        raise HTTPException(status_code=500, detail=f"Video generation failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail="Video generation failed") from exc
