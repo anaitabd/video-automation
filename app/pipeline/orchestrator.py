@@ -13,26 +13,28 @@ logger = get_logger(__name__)
 
 
 def _render_script_for_voice(script: Dict[str, object]) -> str:
-    sections = script.get("sections", [])
-    if not isinstance(sections, list):
-        sections = []
+    title = script.get("title", "")
+    scenes = script.get("scenes", [])
+    if not isinstance(scenes, list):
+        scenes = []
 
-    section_lines = [f"- {section}" for section in sections if isinstance(section, str)]
+    scene_lines = []
+    for index, scene in enumerate(scenes, start=1):
+        if not isinstance(scene, dict):
+            continue
+        text = scene.get("text", "")
+        duration = scene.get("duration_seconds", "")
+        emotion = scene.get("emotion", "")
+        scene_lines.append(f"Scene {index} ({duration}s, {emotion}): {text}")
 
-    return "\n".join(
-        [
-            f"Hook: {script.get('hook', '')}",
-            "Sections:",
-            *section_lines,
-            f"Call to action: {script.get('cta', '')}",
-        ]
-    ).strip()
+    return "\n".join([f"Title: {title}", *scene_lines]).strip()
 
 
 @dataclass
 class PipelineRequest:
     topic: str
-    tone: str = "professional"
+    tone: str = "documentary"
+    target_duration_seconds: int = 120
 
 
 class VideoAutomationOrchestrator:
@@ -50,7 +52,7 @@ class VideoAutomationOrchestrator:
 
         try:
             logger.info("Step 1/6 Generate script video_id=%s", video_id)
-            script_data = self.script_generator.generate(topic=request.topic, tone=request.tone)
+            script_data = self.script_generator.generate(topic=request.topic, tone=request.tone, target_duration_seconds=request.target_duration_seconds)
             rendered_script = _render_script_for_voice(script=script_data["script"])
 
             logger.info("Step 2/6 Generate voice video_id=%s", video_id)
